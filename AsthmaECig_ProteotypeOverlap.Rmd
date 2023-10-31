@@ -1,0 +1,331 @@
+---
+title: "TCORS ASTHMA OVERLAP"
+author: "Elise Hickman"
+date: "2023-10-10"
+output: html_document
+---
+
+# Set up workspace
+
+```{r message = FALSE, warning = FALSE}
+# Clear global environment
+rm(list=ls())
+
+# Load packages
+library(janitor) # for data cleaning
+library(openxlsx) # for writing out files
+library(tidyverse) # for data organization and manipulation
+library(vegan) # for jaccard
+library(cluster) # for clustering
+library(factoextra) # for clustering
+library(pheatmap)
+
+# Set theme
+theme_set(theme_bw())
+
+# Set seed (if needed)
+set.seed(8016)
+```
+
+# Import Data
+
+First, we will read in data describing proteins that have significantly higher or lower expression in the sputum of e-cig users vs. controls (from Reidel et al 2017) or in different proteotypes of asthma (eosinophilic, neutrophilic, atopic) vs. controls (from Schofield et al 2019). Note that for e-cig users, these proteins were all significantly higher in the e-cig group, but for the asthmatic groups, some proteins were lower in asthmatics vs. controls.
+
+```{r}
+ecig <- read.xlsx("1_InputData/Ecig_vs_Control.xlsx")
+
+eos <- read.xlsx("1_InputData/EosinophilicAsthma_vs_Control.xlsx") %>%
+  filter(fdr_pval < 0.05) 
+
+neut <- read.xlsx("1_InputData/NeutrophilicAsthma_vs_Control.xlsx") %>%
+  filter(fdr_pval < 0.05) 
+
+atop <- read.xlsx("1_InputData/AtopicAsthma_vs_Control.xlsx") %>%
+  filter(fdr_pval < 0.05) 
+```
+
+# Quantify Overlap By Counts
+
+How many proteins overlap between the e-cig and asthma lists?
+
+```{r}
+overlap_ecig_eos <- ecig$protein[ecig$protein %in% eos$protein]
+length(overlap_ecig_eos)
+
+overlap_ecig_neut <- ecig$protein[ecig$protein %in% neut$protein]
+length(overlap_ecig_neut)
+
+overlap_ecig_atop <- ecig$protein[ecig$protein %in% atop$protein]
+length(overlap_ecig_atop)
+```
+
+
+How many proteins overlap between the e-cig and asthma lists when only the proteins that were higher in asthma vs. control are considered?
+
+```{r}
+# Filter data
+ecig_higher <- ecig %>% filter(direction_vs_controls == "higher")
+eos_higher <- eos %>% filter(direction_vs_controls == " higher")
+neut_higher <- neut %>% filter(direction_vs_controls == " higher")
+atop_higher <- atop %>% filter(direction_vs_controls == " higher")
+
+# Quantify overlap 
+overlap_ecig_eos_higher <- ecig$protein[ecig_higher$protein %in% eos_higher$protein]
+length(overlap_ecig_eos_higher)
+
+overlap_ecig_neut_higher <- ecig$protein[ecig_higher$protein %in% neut_higher$protein]
+length(overlap_ecig_neut_higher)
+
+overlap_ecig_atop_higher <- ecig$protein[ecig_higher$protein %in% atop_higher$protein]
+length(overlap_ecig_atop_higher)
+```
+
+How many proteins overlap between the e-cig and asthma lists when only the proteins that were lower in asthma vs. control are considered?
+
+```{r}
+# Filter data
+ecig_lower <- ecig %>% filter(direction_vs_controls == "lower")
+eos_lower <- eos %>% filter(direction_vs_controls == " lower")
+neut_lower <- neut %>% filter(direction_vs_controls == " lower")
+atop_lower <- atop %>% filter(direction_vs_controls == " lower")
+
+# Quantify overlap 
+overlap_ecig_eos_lower <- ecig$protein[ecig_lower$protein %in% eos_lower$protein]
+length(overlap_ecig_eos_lower)
+
+overlap_ecig_neut_lower <- ecig$protein[ecig_lower$protein %in% neut_lower$protein]
+length(overlap_ecig_neut_lower)
+
+overlap_ecig_atop_lower <- ecig$protein[ecig_lower$protein %in% atop_lower$protein]
+length(overlap_ecig_atop_lower)
+```
+
+How many proteins overlap between the e-cig and asthma lists when only the proteins that were higher in asthma vs. control are considered and when asthma subtypes are pooled together?
+
+```{r}
+# Extract unique proteins from the eosinophilic and neutrophilic lists (since there was no overlap with atopic)
+unique_asthma_higher <- unique(c(eos_higher$protein, neut_higher$protein))
+
+# Determine overlap between ecig and asthma
+overlap_ecig_asthma_all <- ecig$protein[ecig$protein %in% unique_asthma_higher]
+length(overlap_ecig_asthma_all)
+```
+
+
+# Quantify Overlap by Jaccard + Heatmap for All Proteins
+
+## Create Count Matrix
+
+First, make a count matrix of presence/absence for proteins significantly increased in each group.
+```{r}
+# Make a list of unique genes that were higher across asthma proteotypes and e-cig users
+all_proteins <- unique(c(eos_higher$protein, neut_higher$protein, ecig$protein, atop_higher$protein))
+
+# Create count matrix based on presence/absence in each disease 
+
+## Add a column to each data frame where the column name is the group and 1 indicates presence in that data frame
+ecig <- ecig %>% mutate(ecig = 1)
+eos_higher <- eos_higher %>% mutate(eos_asthma = 1)
+neut_higher <- neut_higher %>% mutate(neut_asthma = 1)
+atop_higher <- atop_higher %>% mutate(atop_asthma = 1)
+
+# Merge all of the count columns and replace NAs (absence of a protein in that list) with zero
+protein_countmatrix <- data.frame(protein = all_proteins) %>%
+  left_join(ecig %>% select(c(protein, ecig)), by = "protein") %>%
+  left_join(eos_higher %>% select(c(protein, eos_asthma)), by = "protein") %>%
+  left_join(neut_higher %>% select(c(protein, neut_asthma)), by = "protein") %>%
+  left_join(atop_higher %>% select(c(protein, atop_asthma)), by = "protein") %>%
+  replace(is.na(.), 0) %>%
+  column_to_rownames("protein")
+```
+
+## Determine Jaccard Distance Between Groups
+
+Jaccard distance between groups with all proteins included (not just those that are shared between e-cig and asthma):
+
+```{r}
+# Transpose dataframe and convert to matrix
+protein_countmatrix_T <- as.data.frame(t(protein_countmatrix))
+
+# Calculate Jaccard *distance* for groups
+group_jaccard_dist <- vegdist(protein_countmatrix_T , method="jaccard", na.rm = TRUE)
+group_jaccard_dist <- as.data.frame(as.matrix(group_jaccard_dist))
+
+# Calculate Jaccard *similarity* (JD+JS=1  ->  JS=1-JD) for genes
+group_jaccard_sim <- group_jaccard_dist %>% mutate(across(everything(),~1-.x))
+
+# View Jaccard similarity
+group_jaccard_sim
+```
+
+
+## Cluster Proteins By Jaccard Distance
+
+Jaccard distance between genes and determining number of clusters:
+
+```{r}
+# Calculate Jaccard *distance* for proteins
+protein_jaccard_dist <- vegdist(protein_countmatrix, method="jaccard")
+protein_jaccard_dist <- as.data.frame(as.matrix(protein_jaccard_dist))
+
+# Cluster proteins
+protein_cluster_samps <-diana(protein_jaccard_dist , diss=TRUE)
+
+#use WSS and silhouette profile to identify the optimal number of clusters. This is subjective!! Generally look for "elbow point" in WSS and peak in silhouette profile. Could also look at "gap_stat" which is fairly common. Note, you will need to adjust your k.max to reflect the size of your data frame. It can't be >= the max number of rows you have.
+fviz_nbclust(protein_countmatrix, diss = protein_jaccard_dist, method = "wss", FUN=hcut, hc_func="diana", k.max=20)
+fviz_nbclust(protein_countmatrix , diss = protein_jaccard_dist, method = "silhouette", FUN=hcut, hc_func="diana", k.max=20)
+```
+
+Based on these plots, we will proceed with 10 clusters of proteins. 
+
+```{r}
+# Choose number of clusters
+protein_cluster_assignments <- cutree(protein_cluster_samps, k = 10)
+
+# Add in cluster labels to datafame and arrange by cluster number
+protein_countmatrix$cluster <- protein_cluster_assignments 
+protein_countmatrix <- protein_countmatrix %>% arrange(cluster)
+```
+
+## Make a Heatmap
+```{r}
+# Set order for heatmap
+cluster_order <- c(10, 1, 6, 5, 3, 8, 2, 7, 4, 9)
+
+# Create a new data frame with modifications needed for heatmap
+hm_data <- protein_countmatrix %>%
+  relocate(neut_asthma, .before = eos_asthma) %>%
+  rename("E-Cig" = "ecig", "Neut Asthma" = "neut_asthma", "Eos Asthma" = "eos_asthma", "Atopic Asthma" = "atop_asthma") %>%
+  arrange(factor(cluster, levels = cluster_order))
+
+# Add an index value into the dataframe so we can add splits between clusters in heatmap
+hm_data$index <- 1:nrow(hm_data)
+
+# Make lists of where breaks should be placed in the heatmap to separate clusters of samples
+seprows <- hm_data %>% group_by(cluster) %>% slice_max(n=1, order_by=index)
+seprows <- sort(seprows$index)
+
+# Make heatmap
+heatmap <- pheatmap(hm_data %>% select(-c(cluster, index)),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         show_colnames = TRUE,
+         color = c("gray91","orange1"),
+         legend = FALSE,
+         fontsize = 30,
+         angle_col = 0,
+         gaps_row = seprows, 
+         border_color = "black")
+
+heatmap
+
+ggsave(heatmap, file = "2_OutputFigs/Ecig_Asthma_Overlap_Heatmap_All.png", width = 12, height = 20)
+```
+
+# Heatmap and Jaccard for Only Shared Proteins Between E-Cig and Asthma
+
+Without annotation:
+```{r}
+# Subset data
+protein_countmatrix_subset <- protein_countmatrix %>%
+  filter(cluster == 2 | cluster == 7 | cluster == 4)
+
+# Set order for heatmap
+cluster_order <- c(2, 7, 4)
+
+# Create new heatmap dataframe
+hm_data_subset <- protein_countmatrix_subset %>%
+  relocate(neut_asthma, .before = eos_asthma) %>%
+  rename("E-Cig" = "ecig", "Neut Asthma" = "neut_asthma", "Eos Asthma" = "eos_asthma", "Atopic Asthma" = "atop_asthma") %>%
+  arrange(factor(cluster, levels = cluster_order))
+
+# Add an index value into the dataframe so we can add splits between clusters in heatmap
+hm_data_subset$index <- 1:nrow(hm_data_subset)
+
+# Make lists of where breaks should be placed in the heatmap to separate clusters of samples
+seprows <- hm_data_subset %>% group_by(cluster) %>% slice_max(n=1, order_by=index)
+seprows <- sort(seprows$index)
+
+# Make heatmap
+heatmap_subset <- pheatmap(hm_data_subset %>% select(-c(cluster, index)),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         color = c("gray91","orange1"),
+         legend = FALSE,
+         fontsize_row = 25,
+         angle_col = 0,
+         gaps_row = seprows, 
+         border_color = "black")
+
+heatmap_subset
+
+ggsave(heatmap_subset, file = "2_OutputFigs/Ecig_Asthma_Overlap_Heatmap_Subset.png", width = 12, height = 15)
+```
+
+Write out protein list for annotation:
+
+```{r}
+write.xlsx(protein_countmatrix_subset %>% rownames_to_column("protein"), "3_OutputData/ECig_Asthma_Overlap_Proteins.xlsx")
+```
+
+
+With annotation:
+
+```{r}
+# Read in annotation data frame
+anno <- read.xlsx("1_InputData/ECig_Asthma_Overlap_Proteins_Annotation.xlsx") %>%
+  column_to_rownames("protein") %>%
+  mutate(Annotation = as.factor(Annotation))
+
+# Define annontation colors
+hm_colors <- list(
+  Annotation = c(`General Inflammation` = "#332288", 
+                 `Neutrophilic Inflammation` = "#88CCEE", 
+                 `Eosinophilic Inflammation` ="#6699CC",   
+                 `Tissue Remodeling` = "#CC6677",
+                 `Bioenergetics` = "#117733", 
+                 `Redox Balance` = "#44AA99", 
+                 `Signal Transduction` = "#AA4499"))
+
+# Make heatmap
+heatmap_subset_anno <- pheatmap(hm_data_subset %>% select(-c(cluster, index)),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         legend = FALSE,
+         color = c("gray91","orange1"),
+         fontsize_row = 12,
+         angle_col = 0,
+         gaps_row = seprows, 
+         border_color = "black",
+         annotation_row = anno,
+         annotation_colors = hm_colors)
+
+heatmap_subset_anno
+
+ggsave(heatmap_subset_anno, file = "2_OutputFigs/Ecig_Asthma_Overlap_Heatmap_Subset_Anno.png", width = 7, height = 5)
+
+```
+
+Jaccard distance for zoomed in plot:
+```{r}
+# Transpose dataframe and convert to matrix
+protein_countmatrix_subset_T <- as.data.frame(t(protein_countmatrix_subset %>% select(-cluster)))
+
+# Calculate Jaccard *distance* for groups
+group_jaccard_dist_subset <- vegdist(protein_countmatrix_subset_T , method="jaccard", na.rm = TRUE)
+group_jaccard_dist_subset <- as.data.frame(as.matrix(group_jaccard_dist_subset))
+
+# Calculate Jaccard *similarity* (JD+JS=1  ->  JS=1-JD) for genes
+group_jaccard_sim_subset <- group_jaccard_dist_subset %>% mutate(across(everything(),~1-.x))
+
+# View Jaccard similarity
+group_jaccard_sim_subset
+```
+
+
+
